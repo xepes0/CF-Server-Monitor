@@ -1,0 +1,250 @@
+name: Fix agent ping mode
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fix-ping-mode.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Patch shell agents
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          files = [
+              Path('public/install.sh'),
+              Path('public/install-alpine.sh'),
+              Path('public/install-openwrt.sh'),
+              Path('public/install-synology.sh'),
+              Path('public/install-mac.sh'),
+          ]
+
+          def add_after_matching_lines(text, predicate, make_lines):
+              lines = text.splitlines()
+              out = []
+              changed = 0
+              for i, line in enumerate(lines):
+                  out.append(line)
+                  if predicate(line):
+                      next_line = lines[i + 1] if i + 1 < len(lines) else ''
+                      additions = make_lines(line)
+                      if additions and not any(a.strip() and a.strip() in next_line for a in additions):
+                          out.extend(additions)
+                          changed += 1
+              return '\n'.join(out) + ('\n' if text.endswith('\n') else ''), changed
+
+          for path in files:
+              text = path.read_text(encoding='utf-8')
+              original = text
+
+              # Agent version: this is a protocol/behavior change.
+              text = text.replace('AGENT_VERSION="1.3.8"', 'AGENT_VERSION="1.3.9"', 1)
+
+              # Schema 6 is the first schema carrying ping_mode. Do not advertise 7 here,
+              # because schema 7 also enables the extra-node fields that these legacy shell
+              # agents do not yet implement.
+              if 'X-Agent-Config-Schema: 3' not in text:
+                  raise SystemExit(f'{path}: expected legacy schema header not found')
+              text = text.replace('X-Agent-Config-Schema: 3', 'X-Agent-Config-Schema: 6', 1)
+
+              if 'if [ "$new_schema" != "3" ]; then' not in text:
+                  raise SystemExit(f'{path}: expected legacy schema validation not found')
+              text = text.replace('if [ "$new_schema" != "3" ]; then', 'if [ "$new_schema" != "6" ]; then', 1)
+
+              # Critical bug fix: explicit ICMP mode must bypass TCP probing. The existing
+              # platform-specific ICMP block then runs unchanged, preserving compatibility.
+              old_tcp_gate = 'if has_nc_zero_io && get_time_ms >/dev/null 2>&1; then'
+              if old_tcp_gate not in text:
+                  raise SystemExit(f'{path}: TCP probe gate not found')
+              text = text.replace(
+                  old_tcp_gate,
+                  'if [ "${PING_MODE:-tcp}" != "icmp" ] && has_nc_zero_io && get_time_ms >/dev/null 2>&1; then',
+                  1,
+              )
+              text = text.replace('# TCP 不可用，回退 ICMP', '# ICMP 模式，或 TCP 探测不可用时回退 ICMP', 1)
+
+              # Read PING_MODE from local config everywhere REPORT_INTERVAL is read.
+              text, read_count = add_after_matching_lines(
+                  text,
+                  lambda line: 'REPORT_INTERVAL) REPORT_INTERVAL=' in line,
+                  lambda line: [
+                      line[:len(line)-len(line.lstrip())] +
+                      'PING_MODE) PING_MODE="${value%\\\"}"; PING_MODE="${PING_MODE#\\\"}" ;;'
+                  ],
+              )
+              if read_count < 1:
+                  raise SystemExit(f'{path}: config reader insertion failed')
+
+              # Initialize installer variable.
+              text, _ = add_after_matching_lines(
+                  text,
+                  lambda line: line.strip() == 'REPORT_INTERVAL=""',
+                  lambda line: [line[:len(line)-len(line.lstrip())] + 'PING_MODE=""'],
+              )
+
+              # Optional CLI override for fresh installs.
+              text, _ = add_after_matching_lines(
+                  text,
+                  lambda line: '-interval=*) REPORT_INTERVAL=' in line,
+                  lambda line: [
+                      line[:len(line)-len(line.lstrip())] +
+                      '-ping_mode=*|-ping-mode=*) PING_MODE="${arg#*=}" ;;'
+                  ],
+              )
+
+              # Default + validation. This may occur in the generated agent and installer;
+              # applying it in both places is intentional.
+              text, default_count = add_after_matching_lines(
+                  text,
+                  lambda line: line.strip() == 'REPORT_INTERVAL=${REPORT_INTERVAL:-60}',
+                  lambda line: [
+                      line[:len(line)-len(line.lstrip())] + 'PING_MODE=${PING_MODE:-tcp}',
+                      line[:len(line)-len(line.lstrip())] + 'case "$PING_MODE" in tcp|icmp) ;; *) PING_MODE=tcp ;; esac',
+                  ],
+              )
+              if default_count < 1:
+                  raise SystemExit(f'{path}: ping mode default insertion failed')
+
+              # Persist PING_MODE in generated config files.
+              text, _ = add_after_matching_lines(
+                  text,
+                  lambda line: line.strip() == 'REPORT_INTERVAL="${REPORT_INTERVAL}"',
+                  lambda line: [line[:len(line)-len(line.lstrip())] + 'PING_MODE="${PING_MODE:-tcp}"'],
+              )
+
+              # persist_dynamic_config(): add the 10th argument and config entry.
+              needle = '-v iface="$9" \'\''
+              if needle not in text:
+                  raise SystemExit(f'{path}: persist_dynamic_config iface argument not found')
+              text = text.replace(needle, '-v iface="$9" -v ping_mode="${10}" \'\'', 1)
+
+              lines = text.splitlines()
+              out = []
+              begin_done = handler_done = end_done = False
+              for line in lines:
+                  if (not begin_done and 'BEGIN {' in line and 'ni=0' in line and 'pm=0' not in line):
+                      line = line.replace('ni=0 }', 'ni=0; pm=0 }')
+                      if 'pm=0' not in line:
+                          line = re.sub(r'(ni=0)(\s*\})', r'\1; pm=0\2', line, count=1)
+                      begin_done = 'pm=0' in line
+                  out.append(line)
+                  if (not handler_done and '/^INTERFACE=/' in line and 'ni=1' in line):
+                      indent = line[:len(line)-len(line.lstrip())]
+                      out.append(indent + '/^PING_MODE=/ { print "PING_MODE=\\\"" ping_mode "\\\""; pm=1; next }')
+                      handler_done = True
+                  if (not end_done and 'if (!ni) print "INTERFACE=' in line):
+                      indent = line[:len(line)-len(line.lstrip())]
+                      out.append(indent + 'if (!pm) print "PING_MODE=\\\"" ping_mode "\\\""')
+                      end_done = True
+              text = '\n'.join(out) + ('\n' if text.endswith('\n') else '')
+              if not (begin_done and handler_done and end_done):
+                  raise SystemExit(f'{path}: persist_dynamic_config PING_MODE fields were not fully inserted')
+
+              # Remote config declarations.
+              decl = 'local new_collect new_report new_reset new_schema new_ct new_cu new_cm new_bd new_interface'
+              if decl not in text:
+                  raise SystemExit(f'{path}: remote config local declaration not found')
+              text = text.replace(
+                  decl,
+                  decl + ' new_ping_mode new_connection_mode new_wss_report_interval',
+                  1,
+              )
+
+              # Initialize added fields after new_update for set -u compatible agents.
+              text, init_count = add_after_matching_lines(
+                  text,
+                  lambda line: line.strip() == 'new_update=""',
+                  lambda line: [
+                      line[:len(line)-len(line.lstrip())] + 'new_ping_mode=""',
+                      line[:len(line)-len(line.lstrip())] + 'new_connection_mode=""',
+                      line[:len(line)-len(line.lstrip())] + 'new_wss_report_interval=""',
+                  ],
+              )
+              if init_count < 1:
+                  raise SystemExit(f'{path}: remote config field initialization failed')
+
+              # Accept schema-4/5 fields as compatibility fields and schema-6 ping_mode.
+              lines = text.splitlines()
+              out = []
+              parser_done = False
+              for line in lines:
+                  out.append(line)
+                  if (not parser_done and line.strip().startswith('interface)') and 'new_interface=' in line):
+                      indent = line[:len(line)-len(line.lstrip())]
+                      out.extend([
+                          indent + 'connection_mode)     new_connection_mode="$_v" ;;',
+                          indent + 'wss_report_interval) new_wss_report_interval="$_v" ;;',
+                          indent + 'ping_mode)           new_ping_mode="$_v" ;;',
+                      ])
+                      parser_done = True
+              text = '\n'.join(out) + ('\n' if text.endswith('\n') else '')
+              if not parser_done:
+                  raise SystemExit(f'{path}: remote config parser insertion failed')
+
+              # Validate compatibility fields and normalize ping mode before schema check.
+              schema_line = '    if [ "$new_schema" != "6" ]; then'
+              if schema_line not in text:
+                  raise SystemExit(f'{path}: schema 6 validation line not found after upgrade')
+              validation = (
+                  '    new_ping_mode=${new_ping_mode:-tcp}\n'
+                  '    case "$new_ping_mode" in tcp|icmp) ;; *) log_warn_debug "Remote config rejected: invalid ping_mode=${new_ping_mode}"; return 1 ;; esac\n'
+                  '    case "${new_connection_mode:-http}" in auto|http) ;; *) log_warn_debug "Remote config rejected: invalid connection_mode=${new_connection_mode}"; return 1 ;; esac\n'
+                  '    case "${new_wss_report_interval:-}" in \'\'|1|2|3|4|5) ;; *) log_warn_debug "Remote config rejected: invalid wss_report_interval=${new_wss_report_interval}"; return 1 ;; esac\n'
+              )
+              text = text.replace(schema_line, validation + schema_line, 1)
+
+              # Persist and apply ping mode dynamically.
+              old_call = 'persist_dynamic_config "$new_collect" "$new_report" "$new_reset" "$new_md5" "$new_ct" "$new_cu" "$new_cm" "$new_bd" "$new_interface" || return 1'
+              if old_call not in text:
+                  raise SystemExit(f'{path}: persist_dynamic_config call not found')
+              text = text.replace(old_call, old_call.replace('"$new_interface" ||', '"$new_interface" "$new_ping_mode" ||'), 1)
+
+              apply_line = '        INTERFACE="$new_interface"'
+              if apply_line not in text:
+                  raise SystemExit(f'{path}: dynamic INTERFACE assignment not found')
+              text = text.replace(apply_line, apply_line + '\n        PING_MODE="$new_ping_mode"', 1)
+
+              # Include ping mode in debug logs for diagnosis.
+              text = text.replace(
+                  'log_info "Dynamic configuration applied: md5=${CONFIG_MD5} interface=${INTERFACE:-auto} ct=${CT_NODE:-} cu=${CU_NODE:-} cm=${CM_NODE:-} bd=${BD_NODE:-}"',
+                  'log_info "Dynamic configuration applied: md5=${CONFIG_MD5} interface=${INTERFACE:-auto} ping_mode=${PING_MODE:-tcp} ct=${CT_NODE:-} cu=${CU_NODE:-} cm=${CM_NODE:-} bd=${BD_NODE:-}"',
+                  1,
+              )
+
+              if text == original:
+                  raise SystemExit(f'{path}: no changes made')
+              path.write_text(text, encoding='utf-8')
+              print(f'patched {path}')
+
+      - name: Verify patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in public/install.sh public/install-alpine.sh public/install-openwrt.sh public/install-synology.sh public/install-mac.sh; do
+            echo "checking $f"
+            grep -q 'X-Agent-Config-Schema: 6' "$f"
+            grep -q 'ping_mode)           new_ping_mode=' "$f"
+            grep -q 'PING_MODE="$new_ping_mode"' "$f"
+            grep -q '\${PING_MODE:-tcp}.*!=.*icmp' "$f"
+            bash -n "$f"
+          done
+
+      - name: Commit fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add public/install.sh public/install-alpine.sh public/install-openwrt.sh public/install-synology.sh public/install-mac.sh
+          git commit -m "fix: honor ICMP ping mode in shell agents"
+          git push
